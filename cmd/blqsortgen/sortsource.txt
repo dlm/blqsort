@@ -1,0 +1,1137 @@
+const (
+	smallPart = 1024
+	swsz      = 384
+	unroll    = 16
+)
+
+func b2i(b bool) int {
+	var i int
+	if b {
+		i = 1
+	}
+	return i
+}
+
+// pivotJitter picks the 0..7 offset of the pivot samples. The C version uses
+// a global PRNG, which would be a data race in Go; a hash of the partition
+// bounds is deterministic (like the stdlib pdqsort) and the heapsort fallback
+// still bounds the worst case.
+func pivotJitter(left, right int) int {
+	h := uint64(left)*0x9E3779B97F4A7C15 ^ uint64(right)
+	h ^= h >> 29
+	return int(h * 0xBF58476D1CE4E5B9 >> 61)
+}
+
+// depthLimit is the number of lopsided splits sortr tolerates before
+// falling back to heapsort.
+func depthLimit(n int) int {
+	return bits.Len(uint(n))
+}
+
+// runLimit is the number of monotone runs (as counted by scanOrder) up to
+// which pdqsort's pattern detection beats blqsort; measured on amd64.
+func runLimit(n int) int {
+	if n <= 1024 {
+		return n / 16
+	}
+	return 16
+}
+
+func s2Func[T any](cmp func(a, b T) int, x, y T) (T, T) {
+	if cmp(y, x) < 0 {
+		return y, x
+	}
+	return x, y
+}
+
+func heapSortFunc[T any](a []T, cmp func(a, b T) int) {
+	n := len(a)
+	if n < 2 {
+		return
+	}
+	for i := n / 2; ; {
+		var k T
+		if i > 0 {
+			i--
+			k = a[i]
+		} else {
+			n--
+			if n == 0 {
+				return
+			}
+			k = a[n]
+			a[n] = a[0]
+		}
+		j := i
+		for j*2+1 < n {
+			child := j*2 + 1
+			if child+1 < n && cmp(a[child], a[child+1]) < 0 {
+				child++
+			}
+			if cmp(k, a[child]) >= 0 {
+				break
+			}
+			a[j] = a[child]
+			j = child
+		}
+		a[j] = k
+	}
+}
+
+func partitionSmallFunc[T any](a []T, left, right int, buf []T, cmp func(a, b T) int) int {
+	outerleft := left
+	pivp := left + (right-left)/2
+	piv := a[pivp]
+
+	// Median of 7 samples spread evenly over the range. The C version samples
+	// both ends and the middle (and then skips the end samples), which picks
+	// extreme pivots on inputs with positional structure.
+	step := (right - left) / 8
+	p0, p1, p2 := pivp-3*step, pivp-2*step, pivp-step
+	p4, p5, p6 := pivp+step, pivp+2*step, pivp+3*step
+	a[p0], a[p1], a[p2], piv, a[p4], a[p5], a[p6] = med7Func(cmp, a[p0], a[p1], a[p2], piv, a[p4], a[p5], a[p6])
+	left++
+
+	a[pivp] = a[outerleft]
+
+	sw := 0
+	lwr := left
+	for right-left >= unroll {
+		for range unroll {
+			x := a[left]
+			h := b2i(cmp(x, piv) < 0)
+			a[lwr] = x
+			buf[sw] = x
+			left++
+			lwr += h
+			sw += 1 - h
+		}
+	}
+	for left <= right {
+		x := a[left]
+		h := b2i(cmp(x, piv) < 0)
+		a[lwr] = x
+		buf[sw] = x
+		left++
+		lwr += h
+		sw += 1 - h
+	}
+	copy(a[lwr:], buf[:sw])
+	lwr--
+	a[outerleft] = a[lwr]
+	a[lwr] = piv
+	return lwr
+}
+
+func partitionFunc[T any](a []T, left, right int, buf []T, cmp func(a, b T) int) int {
+	outerleft := left
+	pivp := left + (right-left)/2
+	piv := a[pivp]
+
+	// Pivot: median of 7 medians of 5, as in the C version, but the 35 samples
+	// are spread evenly over the range (sample 17 is pivp) instead of taken
+	// in consecutive runs at both ends and the middle, which picked extreme
+	// pivots on inputs with positional structure.
+	j := pivotJitter(left, right)
+	step := (right - left) / 36
+	at := func(k int) int {
+		return pivp + (k-17)*step + j
+	}
+	m5 := func(k int) {
+		p0, p1, p2, p3, p4 := at(k), at(k+1), at(k+2), at(k+3), at(k+4)
+		a[p0], a[p1], a[p2], a[p3], a[p4] = med5Func(cmp, a[p0], a[p1], a[p2], a[p3], a[p4])
+	}
+	m5(0)
+	m5(5)
+	m5(10)
+	p15, p16, p18, p19 := at(15), at(16), at(18), at(19)
+	a[p15], a[p16], piv, a[p18], a[p19] = med5Func(cmp, a[p15], a[p16], piv, a[p18], a[p19])
+	m5(20)
+	m5(25)
+	m5(30)
+	p2, p7, p12, p22, p27, p32 := at(2), at(7), at(12), at(22), at(27), at(32)
+	a[p2], a[p7], a[p12], piv, a[p22], a[p27], a[p32] = med7Func(cmp, a[p2], a[p7], a[p12], piv, a[p22], a[p27], a[p32])
+
+	left++
+	a[pivp] = a[outerleft]
+
+	rwr, sw := right, 0
+	lwr := left
+
+	for unroll < swsz-sw && left < right-unroll {
+		avail := min(right-left, swsz-sw)
+		endp := right - avail
+		for right > endp+unroll {
+			for range unroll {
+				x := a[right]
+				h := b2i(cmp(x, piv) < 0)
+				a[rwr] = x
+				buf[sw] = x
+				right--
+				rwr -= 1 - h
+				sw += h
+			}
+		}
+	}
+
+	for right-left >= unroll && (rwr-right > unroll || left-lwr > unroll) {
+		for rwr-right > unroll && right-left >= unroll {
+			for range unroll {
+				x := a[left]
+				h := b2i(cmp(x, piv) < 0)
+				a[lwr] = x
+				a[rwr] = x
+				left++
+				lwr += h
+				rwr -= 1 - h
+			}
+		}
+		for left-lwr > unroll && right-left >= unroll {
+			for range unroll {
+				x := a[right]
+				h := b2i(cmp(x, piv) < 0)
+				a[rwr] = x
+				a[lwr] = x
+				right--
+				rwr -= 1 - h
+				lwr += h
+			}
+		}
+	}
+	for (lwr < left || rwr > right) && left <= right {
+		for rwr > right && left <= right {
+			x := a[left]
+			left++
+			if cmp(x, piv) < 0 {
+				a[lwr] = x
+				lwr++
+			} else {
+				a[rwr] = x
+				rwr--
+			}
+		}
+		for lwr < left && left <= right {
+			x := a[right]
+			right--
+			if cmp(x, piv) < 0 {
+				a[lwr] = x
+				lwr++
+			} else {
+				a[rwr] = x
+				rwr--
+			}
+		}
+	}
+	for left <= right {
+		if cmp(a[left], piv) < 0 {
+			left++
+			lwr++
+		} else {
+			a[left], a[right] = a[right], a[left]
+			right--
+			rwr--
+		}
+	}
+	copy(a[lwr:], buf[:sw])
+	a[outerleft] = a[rwr]
+	a[rwr] = piv
+	return rwr
+}
+
+// smallSortFunc differs from the C version, which has no duplicate handling below
+// SMALLPART and goes quadratic within a part when most elements equal the
+// pivot. Like sortrFunc, a tiny left side collects the pivot's duplicates, splits
+// that make no real progress count against an introsort-style limit, and
+// recursion goes into the smaller side.
+func smallSortFunc[T any](a []T, left, right int, buf []T, cmp func(a, b T) int) {
+	limit := depthLimit(right - left + 1)
+	for right-left > 17 {
+		n := right - left
+		// Part already sorted (pdqsort detects this too); costs about 16
+		// compares otherwise.
+		if runs, _ := scanOrderFunc(a[left:right+1], 1, cmp); runs == 1 {
+			return
+		}
+		mid := partitionSmallFunc(a, left, right, buf, cmp)
+		if mid-left < n/16 {
+			smallSortFunc(a, left, mid-1, buf, cmp)
+			piv := a[mid]
+			mid++
+			// collect duplicates
+			for p := mid; p <= right; p++ {
+				if cmp(piv, a[p]) >= 0 {
+					a[mid], a[p] = a[p], a[mid]
+					mid++
+				}
+			}
+			if mid-left < n/16 {
+				if limit--; limit < 0 {
+					heapSortFunc(a[mid:right+1], cmp)
+					return
+				}
+			}
+			left = mid
+			continue
+		}
+		if right-mid < n/16 {
+			if limit--; limit < 0 {
+				heapSortFunc(a[left:right+1], cmp)
+				return
+			}
+		}
+		if mid-left < right-mid {
+			smallSortFunc(a, left, mid-1, buf, cmp)
+			left = mid + 1
+		} else {
+			smallSortFunc(a, mid+1, right, buf, cmp)
+			right = mid - 1
+		}
+	}
+	sortingNetworkFunc(a[left:right+1], cmp)
+}
+
+// sortrFunc differs from the C version, which only detects a tiny left side and
+// then gives one second chance before heapsorting the whole part. Here a tiny
+// left side collects the pivot's duplicates (as in C), and any split that
+// makes no real progress, on either side, counts against an introsort-style
+// limit before falling back to heapsort.
+func sortrFunc[T any](a []T, left, right int, buf []T, limit int, cmp func(a, b T) int) {
+	for right-left > smallPart {
+		n := right - left
+		// Part already sorted (pdqsort detects this too); costs about 16
+		// compares otherwise.
+		if runs, _ := scanOrderFunc(a[left:right+1], 1, cmp); runs == 1 {
+			return
+		}
+		mid := partitionFunc(a, left, right, buf, cmp)
+		if mid-left < n/16 {
+			if mid > left {
+				sortrFunc(a, left, mid-1, buf, limit, cmp)
+			}
+			piv := a[mid]
+			mid++
+			// collect duplicates
+			for p := mid; p <= right; p++ {
+				if cmp(piv, a[p]) >= 0 {
+					a[mid], a[p] = a[p], a[mid]
+					mid++
+				}
+			}
+			if mid-left < n/16 {
+				if limit--; limit < 0 {
+					heapSortFunc(a[mid:right+1], cmp)
+					return
+				}
+			}
+			left = mid
+			continue
+		}
+		if right-mid < n/16 {
+			if limit--; limit < 0 {
+				heapSortFunc(a[left:right+1], cmp)
+				return
+			}
+		}
+		if mid-left < right-mid {
+			sortrFunc(a, left, mid-1, buf, limit, cmp)
+			left = mid + 1
+		} else {
+			sortrFunc(a, mid+1, right, buf, limit, cmp)
+			right = mid - 1
+		}
+	}
+	smallSortFunc(a, left, right, buf, cmp)
+}
+
+// scanOrderFunc counts the alternating non-decreasing / non-increasing runs in
+// data, stopping once there are more than k. Each run is consumed by a tight
+// loop whose branch is predictable inside a run (equal elements continue the
+// run, so duplicates cost nothing), as in pdqsort's sortedness check; on
+// unstructured data it gives up after about k comparisons. A drop between two
+// ascending runs counts as a short descending run, so this over-counts by up
+// to 2x; runLimit is calibrated for that. ascEnd is where the first
+// non-decreasing run ends: runs == 1 means sorted, and runs == 2 &&
+// ascEnd == 1 means non-increasing if k >= 2 (so the second run was scanned
+// to the end).
+func scanOrderFunc[T any](data []T, k int, cmp func(a, b T) int) (runs, ascEnd int) {
+	n := len(data)
+	i := 1
+	for i < n && !(cmp(data[i], data[i-1]) < 0) {
+		i++
+	}
+	runs, ascEnd = 1, i
+	for i < n {
+		if runs++; runs > k {
+			break
+		}
+		if runs%2 == 0 {
+			for i < n && !(cmp(data[i-1], data[i]) < 0) {
+				i++
+			}
+		} else {
+			for i < n && !(cmp(data[i], data[i-1]) < 0) {
+				i++
+			}
+		}
+	}
+	return runs, ascEnd
+}
+
+// SortFunc sorts data in ascending order as determined by cmp, like
+// slices.SortFunc. It is only fast if cmp compiles to branch-free code;
+// cmp.Compare does not (it branches on the data). Prefer SortByKey or
+// SortLess.
+func SortFunc[T any](data []T, cmp func(a, b T) int) {
+	n := len(data)
+	if n < 2 {
+		return
+	}
+	if n <= 18 {
+		sortingNetworkFunc(data, cmp)
+		return
+	}
+	// One pass detects sorted, reversed and few-runs input; on unstructured
+	// data it stops after a few dozen comparisons.
+	lim := max(runLimit(n), 2)
+	switch runs, ascEnd := scanOrderFunc(data, lim, cmp); {
+	case runs == 1:
+		return
+	case runs == 2 && ascEnd == 1: // complete scan, since lim >= 2
+		// Non-increasing; reversing it sorts it.
+		for i := 0; i < n/2; i++ {
+			data[i], data[n-1-i] = data[n-1-i], data[i]
+		}
+		return
+	case runs <= runLimit(n):
+		// A few long runs: pdqsort is near-linear there, blqsort is not.
+		slices.SortFunc(data, cmp)
+		return
+	}
+	var buf [smallPart + 1]T
+	sortrFunc(data, 0, n-1, buf[:], depthLimit(n), cmp)
+}
+
+func sort2Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[1]
+	a, b := v[0], v[1]
+	a, b = s2Func(cmp, a, b)
+	v[0], v[1] = a, b
+}
+
+func sort3Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[2]
+	a, b, c := v[0], v[1], v[2]
+	a, b = s2Func(cmp, a, b)
+	b, c = s2Func(cmp, b, c)
+	a, b = s2Func(cmp, a, b)
+	v[0], v[1], v[2] = a, b, c
+}
+
+func sort4Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[3]
+	a, b, c, d := v[0], v[1], v[2], v[3]
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	a, c = s2Func(cmp, a, c)
+	b, d = s2Func(cmp, b, d)
+	b, c = s2Func(cmp, b, c)
+	v[0], v[1], v[2], v[3] = a, b, c, d
+}
+
+func sort5Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[4]
+	a, b, c, d, e := v[0], v[1], v[2], v[3], v[4]
+	b, c = s2Func(cmp, b, c)
+	d, e = s2Func(cmp, d, e)
+	b, d = s2Func(cmp, b, d)
+	a, c = s2Func(cmp, a, c)
+	a, d = s2Func(cmp, a, d)
+	c, e = s2Func(cmp, c, e)
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	b, c = s2Func(cmp, b, c)
+	v[0], v[1], v[2], v[3], v[4] = a, b, c, d, e
+}
+
+func sort6Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[5]
+	a, b, c, d, e, f := v[0], v[1], v[2], v[3], v[4], v[5]
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	a, c = s2Func(cmp, a, c)
+	b, d = s2Func(cmp, b, d)
+	e, f = s2Func(cmp, e, f)
+	a, e = s2Func(cmp, a, e)
+	b, f = s2Func(cmp, b, f)
+	c, e = s2Func(cmp, c, e)
+	d, f = s2Func(cmp, d, f)
+	b, c = s2Func(cmp, b, c)
+	d, e = s2Func(cmp, d, e)
+	c, d = s2Func(cmp, c, d)
+	v[0], v[1], v[2], v[3], v[4], v[5] = a, b, c, d, e, f
+}
+
+func sort7Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[6]
+	a, b, c, d, e, f, g := v[0], v[1], v[2], v[3], v[4], v[5], v[6]
+	a, g = s2Func(cmp, a, g)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	a, c = s2Func(cmp, a, c)
+	b, e = s2Func(cmp, b, e)
+	d, g = s2Func(cmp, d, g)
+	a, b = s2Func(cmp, a, b)
+	c, f = s2Func(cmp, c, f)
+	d, e = s2Func(cmp, d, e)
+	b, c = s2Func(cmp, b, c)
+	e, g = s2Func(cmp, e, g)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	b, c = s2Func(cmp, b, c)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6] = a, b, c, d, e, f, g
+}
+
+func sort8Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[7]
+	a, b, c, d, e, f, g, h := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	a, c = s2Func(cmp, a, c)
+	b, d = s2Func(cmp, b, d)
+	e, g = s2Func(cmp, e, g)
+	f, h = s2Func(cmp, f, h)
+	b, c = s2Func(cmp, b, c)
+	f, g = s2Func(cmp, f, g)
+	a, e = s2Func(cmp, a, e)
+	b, f = s2Func(cmp, b, f)
+	c, g = s2Func(cmp, c, g)
+	d, h = s2Func(cmp, d, h)
+	c, e = s2Func(cmp, c, e)
+	d, f = s2Func(cmp, d, f)
+	b, c = s2Func(cmp, b, c)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7] = a, b, c, d, e, f, g, h
+}
+
+func sort9Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[8]
+	a, b, c, d, e, f, g, h, i := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]
+	a, d = s2Func(cmp, a, d)
+	b, h = s2Func(cmp, b, h)
+	c, f = s2Func(cmp, c, f)
+	e, i = s2Func(cmp, e, i)
+	a, h = s2Func(cmp, a, h)
+	c, e = s2Func(cmp, c, e)
+	d, i = s2Func(cmp, d, i)
+	f, g = s2Func(cmp, f, g)
+	a, c = s2Func(cmp, a, c)
+	b, d = s2Func(cmp, b, d)
+	e, f = s2Func(cmp, e, f)
+	h, i = s2Func(cmp, h, i)
+	b, e = s2Func(cmp, b, e)
+	d, g = s2Func(cmp, d, g)
+	f, h = s2Func(cmp, f, h)
+	a, b = s2Func(cmp, a, b)
+	c, e = s2Func(cmp, c, e)
+	d, f = s2Func(cmp, d, f)
+	g, i = s2Func(cmp, g, i)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	b, c = s2Func(cmp, b, c)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8] = a, b, c, d, e, f, g, h, i
+}
+
+func sort10Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[9]
+	a, b, c, d, e, f, g, h, i, j := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]
+	a, i = s2Func(cmp, a, i)
+	b, j = s2Func(cmp, b, j)
+	c, h = s2Func(cmp, c, h)
+	d, f = s2Func(cmp, d, f)
+	e, g = s2Func(cmp, e, g)
+	a, c = s2Func(cmp, a, c)
+	b, e = s2Func(cmp, b, e)
+	f, i = s2Func(cmp, f, i)
+	h, j = s2Func(cmp, h, j)
+	a, d = s2Func(cmp, a, d)
+	c, e = s2Func(cmp, c, e)
+	f, h = s2Func(cmp, f, h)
+	g, j = s2Func(cmp, g, j)
+	a, b = s2Func(cmp, a, b)
+	d, g = s2Func(cmp, d, g)
+	i, j = s2Func(cmp, i, j)
+	b, f = s2Func(cmp, b, f)
+	c, d = s2Func(cmp, c, d)
+	e, i = s2Func(cmp, e, i)
+	g, h = s2Func(cmp, g, h)
+	b, c = s2Func(cmp, b, c)
+	d, f = s2Func(cmp, d, f)
+	e, g = s2Func(cmp, e, g)
+	h, i = s2Func(cmp, h, i)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9] = a, b, c, d, e, f, g, h, i, j
+}
+
+func sort11Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[10]
+	a, b, c, d, e, f, g, h, i, j, k := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10]
+	a, j = s2Func(cmp, a, j)
+	b, g = s2Func(cmp, b, g)
+	c, e = s2Func(cmp, c, e)
+	d, h = s2Func(cmp, d, h)
+	f, i = s2Func(cmp, f, i)
+	a, b = s2Func(cmp, a, b)
+	d, f = s2Func(cmp, d, f)
+	e, k = s2Func(cmp, e, k)
+	g, j = s2Func(cmp, g, j)
+	h, i = s2Func(cmp, h, i)
+	b, d = s2Func(cmp, b, d)
+	c, f = s2Func(cmp, c, f)
+	e, h = s2Func(cmp, e, h)
+	i, k = s2Func(cmp, i, k)
+	a, e = s2Func(cmp, a, e)
+	b, c = s2Func(cmp, b, c)
+	d, h = s2Func(cmp, d, h)
+	f, j = s2Func(cmp, f, j)
+	g, i = s2Func(cmp, g, i)
+	a, b = s2Func(cmp, a, b)
+	c, g = s2Func(cmp, c, g)
+	e, f = s2Func(cmp, e, f)
+	h, i = s2Func(cmp, h, i)
+	j, k = s2Func(cmp, j, k)
+	c, e = s2Func(cmp, c, e)
+	d, g = s2Func(cmp, d, g)
+	f, h = s2Func(cmp, f, h)
+	i, j = s2Func(cmp, i, j)
+	b, c = s2Func(cmp, b, c)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	h, i = s2Func(cmp, h, i)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10] = a, b, c, d, e, f, g, h, i, j, k
+}
+
+func sort12Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[11]
+	a, b, c, d, e, f, g, h, i, j, k, l := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]
+	a, i = s2Func(cmp, a, i)
+	b, h = s2Func(cmp, b, h)
+	c, g = s2Func(cmp, c, g)
+	d, l = s2Func(cmp, d, l)
+	e, k = s2Func(cmp, e, k)
+	f, j = s2Func(cmp, f, j)
+	a, c = s2Func(cmp, a, c)
+	b, e = s2Func(cmp, b, e)
+	d, f = s2Func(cmp, d, f)
+	g, i = s2Func(cmp, g, i)
+	h, k = s2Func(cmp, h, k)
+	j, l = s2Func(cmp, j, l)
+	a, b = s2Func(cmp, a, b)
+	c, j = s2Func(cmp, c, j)
+	e, h = s2Func(cmp, e, h)
+	f, g = s2Func(cmp, f, g)
+	k, l = s2Func(cmp, k, l)
+	b, d = s2Func(cmp, b, d)
+	c, h = s2Func(cmp, c, h)
+	e, j = s2Func(cmp, e, j)
+	i, k = s2Func(cmp, i, k)
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	i, j = s2Func(cmp, i, j)
+	k, l = s2Func(cmp, k, l)
+	b, c = s2Func(cmp, b, c)
+	d, f = s2Func(cmp, d, f)
+	g, i = s2Func(cmp, g, i)
+	j, k = s2Func(cmp, j, k)
+	c, e = s2Func(cmp, c, e)
+	d, g = s2Func(cmp, d, g)
+	f, i = s2Func(cmp, f, i)
+	h, j = s2Func(cmp, h, j)
+	b, c = s2Func(cmp, b, c)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	h, i = s2Func(cmp, h, i)
+	j, k = s2Func(cmp, j, k)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11] = a, b, c, d, e, f, g, h, i, j, k, l
+}
+
+func sort13Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[12]
+	a, b, c, d, e, f, g, h, i, j, k, l, m := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12]
+	a, m = s2Func(cmp, a, m)
+	b, k = s2Func(cmp, b, k)
+	c, j = s2Func(cmp, c, j)
+	d, h = s2Func(cmp, d, h)
+	f, l = s2Func(cmp, f, l)
+	g, i = s2Func(cmp, g, i)
+	b, g = s2Func(cmp, b, g)
+	c, d = s2Func(cmp, c, d)
+	e, l = s2Func(cmp, e, l)
+	h, j = s2Func(cmp, h, j)
+	i, k = s2Func(cmp, i, k)
+	a, e = s2Func(cmp, a, e)
+	b, c = s2Func(cmp, b, c)
+	d, g = s2Func(cmp, d, g)
+	h, i = s2Func(cmp, h, i)
+	j, k = s2Func(cmp, j, k)
+	l, m = s2Func(cmp, l, m)
+	e, g = s2Func(cmp, e, g)
+	f, j = s2Func(cmp, f, j)
+	i, l = s2Func(cmp, i, l)
+	k, m = s2Func(cmp, k, m)
+	a, f = s2Func(cmp, a, f)
+	d, i = s2Func(cmp, d, i)
+	e, h = s2Func(cmp, e, h)
+	g, l = s2Func(cmp, g, l)
+	j, k = s2Func(cmp, j, k)
+	a, b = s2Func(cmp, a, b)
+	c, f = s2Func(cmp, c, f)
+	g, j = s2Func(cmp, g, j)
+	h, i = s2Func(cmp, h, i)
+	k, l = s2Func(cmp, k, l)
+	b, d = s2Func(cmp, b, d)
+	c, e = s2Func(cmp, c, e)
+	f, g = s2Func(cmp, f, g)
+	j, k = s2Func(cmp, j, k)
+	b, c = s2Func(cmp, b, c)
+	d, e = s2Func(cmp, d, e)
+	f, h = s2Func(cmp, f, h)
+	g, i = s2Func(cmp, g, i)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	i, j = s2Func(cmp, i, j)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12] = a, b, c, d, e, f, g, h, i, j, k, l, m
+}
+
+func sort14Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[13]
+	a, b, c, d, e, f, g, h, i, j, k, l, m, n := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	i, j = s2Func(cmp, i, j)
+	k, l = s2Func(cmp, k, l)
+	m, n = s2Func(cmp, m, n)
+	a, c = s2Func(cmp, a, c)
+	b, d = s2Func(cmp, b, d)
+	e, i = s2Func(cmp, e, i)
+	f, j = s2Func(cmp, f, j)
+	k, m = s2Func(cmp, k, m)
+	l, n = s2Func(cmp, l, n)
+	a, e = s2Func(cmp, a, e)
+	b, c = s2Func(cmp, b, c)
+	d, h = s2Func(cmp, d, h)
+	f, i = s2Func(cmp, f, i)
+	g, k = s2Func(cmp, g, k)
+	j, n = s2Func(cmp, j, n)
+	l, m = s2Func(cmp, l, m)
+	a, g = s2Func(cmp, a, g)
+	b, f = s2Func(cmp, b, f)
+	d, j = s2Func(cmp, d, j)
+	e, k = s2Func(cmp, e, k)
+	h, n = s2Func(cmp, h, n)
+	i, m = s2Func(cmp, i, m)
+	c, k = s2Func(cmp, c, k)
+	d, l = s2Func(cmp, d, l)
+	e, g = s2Func(cmp, e, g)
+	h, j = s2Func(cmp, h, j)
+	b, d = s2Func(cmp, b, d)
+	c, i = s2Func(cmp, c, i)
+	f, l = s2Func(cmp, f, l)
+	g, h = s2Func(cmp, g, h)
+	k, m = s2Func(cmp, k, m)
+	b, e = s2Func(cmp, b, e)
+	c, g = s2Func(cmp, c, g)
+	d, f = s2Func(cmp, d, f)
+	h, l = s2Func(cmp, h, l)
+	i, k = s2Func(cmp, i, k)
+	j, m = s2Func(cmp, j, m)
+	c, e = s2Func(cmp, c, e)
+	d, g = s2Func(cmp, d, g)
+	f, i = s2Func(cmp, f, i)
+	h, k = s2Func(cmp, h, k)
+	j, l = s2Func(cmp, j, l)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	h, i = s2Func(cmp, h, i)
+	j, k = s2Func(cmp, j, k)
+	g, h = s2Func(cmp, g, h)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13] = a, b, c, d, e, f, g, h, i, j, k, l, m, n
+}
+
+func sort15Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[14]
+	a, b, c, d, e, f, g, h, i, j, k, l, m, n, o := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14]
+	b, c = s2Func(cmp, b, c)
+	d, k = s2Func(cmp, d, k)
+	e, o = s2Func(cmp, e, o)
+	f, i = s2Func(cmp, f, i)
+	g, n = s2Func(cmp, g, n)
+	h, m = s2Func(cmp, h, m)
+	j, l = s2Func(cmp, j, l)
+	a, o = s2Func(cmp, a, o)
+	b, f = s2Func(cmp, b, f)
+	c, i = s2Func(cmp, c, i)
+	d, h = s2Func(cmp, d, h)
+	g, j = s2Func(cmp, g, j)
+	k, m = s2Func(cmp, k, m)
+	l, n = s2Func(cmp, l, n)
+	a, h = s2Func(cmp, a, h)
+	b, g = s2Func(cmp, b, g)
+	c, j = s2Func(cmp, c, j)
+	e, k = s2Func(cmp, e, k)
+	f, l = s2Func(cmp, f, l)
+	i, n = s2Func(cmp, i, n)
+	m, o = s2Func(cmp, m, o)
+	a, g = s2Func(cmp, a, g)
+	c, e = s2Func(cmp, c, e)
+	d, f = s2Func(cmp, d, f)
+	h, l = s2Func(cmp, h, l)
+	i, k = s2Func(cmp, i, k)
+	j, m = s2Func(cmp, j, m)
+	n, o = s2Func(cmp, n, o)
+	a, d = s2Func(cmp, a, d)
+	b, c = s2Func(cmp, b, c)
+	e, h = s2Func(cmp, e, h)
+	f, j = s2Func(cmp, f, j)
+	g, i = s2Func(cmp, g, i)
+	k, l = s2Func(cmp, k, l)
+	m, n = s2Func(cmp, m, n)
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	e, g = s2Func(cmp, e, g)
+	h, j = s2Func(cmp, h, j)
+	k, m = s2Func(cmp, k, m)
+	l, n = s2Func(cmp, l, n)
+	b, c = s2Func(cmp, b, c)
+	d, f = s2Func(cmp, d, f)
+	i, k = s2Func(cmp, i, k)
+	l, m = s2Func(cmp, l, m)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	h, i = s2Func(cmp, h, i)
+	j, k = s2Func(cmp, j, k)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	i, j = s2Func(cmp, i, j)
+	k, l = s2Func(cmp, k, l)
+	f, g = s2Func(cmp, f, g)
+	h, i = s2Func(cmp, h, i)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14] = a, b, c, d, e, f, g, h, i, j, k, l, m, n, o
+}
+
+func sort16Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[15]
+	a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]
+	a, n = s2Func(cmp, a, n)
+	b, m = s2Func(cmp, b, m)
+	c, p = s2Func(cmp, c, p)
+	d, o = s2Func(cmp, d, o)
+	e, i = s2Func(cmp, e, i)
+	f, g = s2Func(cmp, f, g)
+	h, l = s2Func(cmp, h, l)
+	j, k = s2Func(cmp, j, k)
+	a, f = s2Func(cmp, a, f)
+	b, h = s2Func(cmp, b, h)
+	c, j = s2Func(cmp, c, j)
+	d, e = s2Func(cmp, d, e)
+	g, n = s2Func(cmp, g, n)
+	i, o = s2Func(cmp, i, o)
+	k, p = s2Func(cmp, k, p)
+	l, m = s2Func(cmp, l, m)
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, i = s2Func(cmp, g, i)
+	h, j = s2Func(cmp, h, j)
+	k, l = s2Func(cmp, k, l)
+	m, n = s2Func(cmp, m, n)
+	o, p = s2Func(cmp, o, p)
+	a, c = s2Func(cmp, a, c)
+	b, d = s2Func(cmp, b, d)
+	e, k = s2Func(cmp, e, k)
+	f, l = s2Func(cmp, f, l)
+	g, h = s2Func(cmp, g, h)
+	i, j = s2Func(cmp, i, j)
+	m, o = s2Func(cmp, m, o)
+	n, p = s2Func(cmp, n, p)
+	b, c = s2Func(cmp, b, c)
+	d, m = s2Func(cmp, d, m)
+	e, g = s2Func(cmp, e, g)
+	f, h = s2Func(cmp, f, h)
+	i, k = s2Func(cmp, i, k)
+	j, l = s2Func(cmp, j, l)
+	n, o = s2Func(cmp, n, o)
+	b, e = s2Func(cmp, b, e)
+	c, g = s2Func(cmp, c, g)
+	f, i = s2Func(cmp, f, i)
+	h, k = s2Func(cmp, h, k)
+	j, n = s2Func(cmp, j, n)
+	l, o = s2Func(cmp, l, o)
+	c, e = s2Func(cmp, c, e)
+	d, g = s2Func(cmp, d, g)
+	j, m = s2Func(cmp, j, m)
+	l, n = s2Func(cmp, l, n)
+	d, f = s2Func(cmp, d, f)
+	g, i = s2Func(cmp, g, i)
+	h, j = s2Func(cmp, h, j)
+	k, m = s2Func(cmp, k, m)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	h, i = s2Func(cmp, h, i)
+	j, k = s2Func(cmp, j, k)
+	l, m = s2Func(cmp, l, m)
+	g, h = s2Func(cmp, g, h)
+	i, j = s2Func(cmp, i, j)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15] = a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p
+}
+
+func sort17Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[16]
+	a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16]
+	a, l = s2Func(cmp, a, l)
+	b, p = s2Func(cmp, b, p)
+	c, k = s2Func(cmp, c, k)
+	d, f = s2Func(cmp, d, f)
+	e, g = s2Func(cmp, e, g)
+	i, m = s2Func(cmp, i, m)
+	j, q = s2Func(cmp, j, q)
+	n, o = s2Func(cmp, n, o)
+	a, g = s2Func(cmp, a, g)
+	b, n = s2Func(cmp, b, n)
+	c, i = s2Func(cmp, c, i)
+	e, o = s2Func(cmp, e, o)
+	f, p = s2Func(cmp, f, p)
+	h, l = s2Func(cmp, h, l)
+	a, i = s2Func(cmp, a, i)
+	d, h = s2Func(cmp, d, h)
+	e, j = s2Func(cmp, e, j)
+	g, q = s2Func(cmp, g, q)
+	k, l = s2Func(cmp, k, l)
+	m, o = s2Func(cmp, m, o)
+	a, c = s2Func(cmp, a, c)
+	b, e = s2Func(cmp, b, e)
+	f, g = s2Func(cmp, f, g)
+	h, n = s2Func(cmp, h, n)
+	i, j = s2Func(cmp, i, j)
+	k, m = s2Func(cmp, k, m)
+	l, o = s2Func(cmp, l, o)
+	p, q = s2Func(cmp, p, q)
+	a, d = s2Func(cmp, a, d)
+	c, f = s2Func(cmp, c, f)
+	g, l = s2Func(cmp, g, l)
+	h, k = s2Func(cmp, h, k)
+	j, n = s2Func(cmp, j, n)
+	m, p = s2Func(cmp, m, p)
+	o, q = s2Func(cmp, o, q)
+	a, b = s2Func(cmp, a, b)
+	d, e = s2Func(cmp, d, e)
+	f, k = s2Func(cmp, f, k)
+	g, j = s2Func(cmp, g, j)
+	h, i = s2Func(cmp, h, i)
+	l, p = s2Func(cmp, l, p)
+	n, o = s2Func(cmp, n, o)
+	b, c = s2Func(cmp, b, c)
+	d, h = s2Func(cmp, d, h)
+	e, i = s2Func(cmp, e, i)
+	g, m = s2Func(cmp, g, m)
+	l, n = s2Func(cmp, l, n)
+	o, p = s2Func(cmp, o, p)
+	b, d = s2Func(cmp, b, d)
+	c, h = s2Func(cmp, c, h)
+	e, f = s2Func(cmp, e, f)
+	j, l = s2Func(cmp, j, l)
+	k, m = s2Func(cmp, k, m)
+	n, o = s2Func(cmp, n, o)
+	c, d = s2Func(cmp, c, d)
+	e, g = s2Func(cmp, e, g)
+	f, h = s2Func(cmp, f, h)
+	i, k = s2Func(cmp, i, k)
+	d, e = s2Func(cmp, d, e)
+	g, i = s2Func(cmp, g, i)
+	h, j = s2Func(cmp, h, j)
+	k, m = s2Func(cmp, k, m)
+	f, g = s2Func(cmp, f, g)
+	h, i = s2Func(cmp, h, i)
+	j, k = s2Func(cmp, j, k)
+	l, m = s2Func(cmp, l, m)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	i, j = s2Func(cmp, i, j)
+	k, l = s2Func(cmp, k, l)
+	m, n = s2Func(cmp, m, n)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16] = a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q
+}
+
+func sort18Func[T any](v []T, cmp func(a, b T) int) {
+	_ = v[17]
+	a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r := v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16], v[17]
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	e, f = s2Func(cmp, e, f)
+	g, h = s2Func(cmp, g, h)
+	i, j = s2Func(cmp, i, j)
+	k, l = s2Func(cmp, k, l)
+	m, n = s2Func(cmp, m, n)
+	o, p = s2Func(cmp, o, p)
+	q, r = s2Func(cmp, q, r)
+	a, c = s2Func(cmp, a, c)
+	b, d = s2Func(cmp, b, d)
+	e, m = s2Func(cmp, e, m)
+	f, n = s2Func(cmp, f, n)
+	g, i = s2Func(cmp, g, i)
+	j, l = s2Func(cmp, j, l)
+	o, q = s2Func(cmp, o, q)
+	p, r = s2Func(cmp, p, r)
+	a, o = s2Func(cmp, a, o)
+	b, q = s2Func(cmp, b, q)
+	c, p = s2Func(cmp, c, p)
+	d, r = s2Func(cmp, d, r)
+	a, g = s2Func(cmp, a, g)
+	b, k = s2Func(cmp, b, k)
+	c, j = s2Func(cmp, c, j)
+	h, q = s2Func(cmp, h, q)
+	i, p = s2Func(cmp, i, p)
+	l, r = s2Func(cmp, l, r)
+	b, e = s2Func(cmp, b, e)
+	d, j = s2Func(cmp, d, j)
+	f, h = s2Func(cmp, f, h)
+	i, o = s2Func(cmp, i, o)
+	k, m = s2Func(cmp, k, m)
+	n, q = s2Func(cmp, n, q)
+	a, b = s2Func(cmp, a, b)
+	c, f = s2Func(cmp, c, f)
+	d, n = s2Func(cmp, d, n)
+	e, o = s2Func(cmp, e, o)
+	h, j = s2Func(cmp, h, j)
+	i, k = s2Func(cmp, i, k)
+	m, p = s2Func(cmp, m, p)
+	q, r = s2Func(cmp, q, r)
+	b, c = s2Func(cmp, b, c)
+	d, f = s2Func(cmp, d, f)
+	e, g = s2Func(cmp, e, g)
+	l, n = s2Func(cmp, l, n)
+	m, o = s2Func(cmp, m, o)
+	p, q = s2Func(cmp, p, q)
+	e, i = s2Func(cmp, e, i)
+	f, m = s2Func(cmp, f, m)
+	g, k = s2Func(cmp, g, k)
+	h, l = s2Func(cmp, h, l)
+	j, n = s2Func(cmp, j, n)
+	b, e = s2Func(cmp, b, e)
+	c, i = s2Func(cmp, c, i)
+	d, g = s2Func(cmp, d, g)
+	f, h = s2Func(cmp, f, h)
+	j, p = s2Func(cmp, j, p)
+	k, m = s2Func(cmp, k, m)
+	l, o = s2Func(cmp, l, o)
+	n, q = s2Func(cmp, n, q)
+	c, e = s2Func(cmp, c, e)
+	f, i = s2Func(cmp, f, i)
+	g, k = s2Func(cmp, g, k)
+	h, l = s2Func(cmp, h, l)
+	j, m = s2Func(cmp, j, m)
+	n, p = s2Func(cmp, n, p)
+	d, f = s2Func(cmp, d, f)
+	g, i = s2Func(cmp, g, i)
+	h, k = s2Func(cmp, h, k)
+	j, l = s2Func(cmp, j, l)
+	m, o = s2Func(cmp, m, o)
+	d, e = s2Func(cmp, d, e)
+	f, g = s2Func(cmp, f, g)
+	h, i = s2Func(cmp, h, i)
+	j, k = s2Func(cmp, j, k)
+	l, m = s2Func(cmp, l, m)
+	n, o = s2Func(cmp, n, o)
+	v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16], v[17] = a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r
+}
+
+func med5Func[T any](cmp func(a, b T) int, a, b, c, d, e T) (T, T, T, T, T) {
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	a, c = s2Func(cmp, a, c)
+	b, d = s2Func(cmp, b, d)
+	b, c = s2Func(cmp, b, c)
+	c, e = s2Func(cmp, c, e)
+	b, c = s2Func(cmp, b, c)
+	return a, b, c, d, e
+}
+
+func med7Func[T any](cmp func(a, b T) int, a, b, c, d, e, f, g T) (T, T, T, T, T, T, T) {
+	a, b = s2Func(cmp, a, b)
+	c, d = s2Func(cmp, c, d)
+	a, c = s2Func(cmp, a, c)
+	b, d = s2Func(cmp, b, d)
+	b, c = s2Func(cmp, b, c)
+	e, f = s2Func(cmp, e, f)
+	e, g = s2Func(cmp, e, g)
+	a, e = s2Func(cmp, a, e)
+	b, f = s2Func(cmp, b, f)
+	c, g = s2Func(cmp, c, g)
+	b, e = s2Func(cmp, b, e)
+	c, e = s2Func(cmp, c, e)
+	d, f = s2Func(cmp, d, f)
+	d, e = s2Func(cmp, d, e)
+	return a, b, c, d, e, f, g
+}
+
+func sortingNetworkFunc[T any](v []T, cmp func(a, b T) int) {
+	switch len(v) {
+	case 2:
+		sort2Func(v, cmp)
+	case 3:
+		sort3Func(v, cmp)
+	case 4:
+		sort4Func(v, cmp)
+	case 5:
+		sort5Func(v, cmp)
+	case 6:
+		sort6Func(v, cmp)
+	case 7:
+		sort7Func(v, cmp)
+	case 8:
+		sort8Func(v, cmp)
+	case 9:
+		sort9Func(v, cmp)
+	case 10:
+		sort10Func(v, cmp)
+	case 11:
+		sort11Func(v, cmp)
+	case 12:
+		sort12Func(v, cmp)
+	case 13:
+		sort13Func(v, cmp)
+	case 14:
+		sort14Func(v, cmp)
+	case 15:
+		sort15Func(v, cmp)
+	case 16:
+		sort16Func(v, cmp)
+	case 17:
+		sort17Func(v, cmp)
+	case 18:
+		sort18Func(v, cmp)
+	}
+}
