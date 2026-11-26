@@ -349,12 +349,8 @@ func scanOrderByKey[T any, K cmp.Ordered](data []T, k int, key func(T) K) (runs,
 	return runs, ascEnd
 }
 
-// SortByKey sorts data in ascending order of key(x), comparing keys with <.
-// The comparison is done here, branch-free, so key only needs to extract the
-// key (e.g. a field). The key of the pivot is computed once per partition,
-// so key is called about once per element per partition pass.
-// NaN keys are not ordered.
-func SortByKey[T any, K cmp.Ordered](data []T, key func(T) K) {
+// sortByKey is SortByKey after NaN handling: NaN keys are not ordered.
+func sortByKey[T any, K cmp.Ordered](data []T, key func(T) K) {
 	n := len(data)
 	if n < 2 {
 		return

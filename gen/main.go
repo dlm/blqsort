@@ -69,11 +69,9 @@ reports whether a sorts before b. A simple less such as a.ID < b.ID compiles
 to branch-free code, which is what makes this fast; avoid branchy less
 functions such as a.X < b.X || (a.X == b.X && a.Y < b.Y).`
 
-	byKeyDoc = `SortByKey sorts data in ascending order of key(x), comparing keys with <.
-The comparison is done here, branch-free, so key only needs to extract the
-key (e.g. a field). The key of the pivot is computed once per partition,
-so key is called about once per element per partition pass.
-NaN keys are not ordered.`
+	// SortByKey itself is in blqsort.go: it moves NaN keys first, then
+	// calls the generated entry, renamed to sortByKey.
+	byKeyDoc = `sortByKey is SortByKey after NaN handling: NaN keys are not ordered.`
 )
 
 func main() {
@@ -99,7 +97,11 @@ func main() {
 			PivotLess: "key({a}) < pk", PivotInit: "pk := key(piv)", Doc: byKeyDoc}},
 	}
 	for _, j := range lib {
-		write(j.out, render(j.sp, blqSrc))
+		out := render(j.sp, blqSrc)
+		if j.out == "bykey_gen.go" {
+			out = strings.Replace(out, "\nfunc SortByKey[", "\nfunc sortByKey[", 1)
+		}
+		write(j.out, out)
 	}
 
 	// --- cmd/blqsortgen: the comparator sort source it specializes ---

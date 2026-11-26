@@ -82,6 +82,38 @@ func TestNaNsMatchSlicesSort(t *testing.T) {
 	}
 }
 
+// SortByKey with NaN keys orders like slices.SortFunc with cmp.Compare on
+// the key (NaNs first), also for the elements whose key is not NaN.
+func TestSortByKeyNaNs(t *testing.T) {
+	type item struct {
+		k  float64
+		id int
+	}
+	rng := rand.New(rand.NewSource(22))
+	for _, n := range []int{1, 2, 3, 17, 18, 19, 100, 1025, 1026, 5000, 100000} {
+		for _, pNaN := range []float64{0, 0.01, 0.05, 0.5, 1} {
+			items := make([]item, n)
+			for i := range items {
+				items[i] = item{rng.NormFloat64(), i}
+				if rng.Float64() < pNaN {
+					items[i].k = math.NaN()
+				}
+			}
+			want := slices.Clone(items)
+			slices.SortFunc(want, func(a, b item) int { return cmp.Compare(a.k, b.k) })
+			SortByKey(items, func(x item) float64 { return x.k })
+			got := make([]float64, n)
+			wantKeys := make([]float64, n)
+			for i := range items {
+				got[i], wantKeys[i] = items[i].k, want[i].k
+			}
+			if !nanEqual(got, wantKeys) {
+				t.Fatalf("n=%d pNaN=%v: keys differ from slices.SortFunc with cmp.Compare", n, pNaN)
+			}
+		}
+	}
+}
+
 func TestStdlibBreakPatterns(t *testing.T) {
 	data := make([]int, 30)
 	for i := range data {

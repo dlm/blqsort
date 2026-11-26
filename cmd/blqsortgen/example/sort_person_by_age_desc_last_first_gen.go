@@ -413,7 +413,7 @@ func scanOrderSortPersonByAgeDescLastFirst(data []Person, k int) (runs, ascEnd i
 
 // sortPersonByAgeDescLastFirst sorts data by Age (descending), then Name.Last, then Name.First, with blqsort (a branchless quicksort,
 // github.com/dlm/blqsort). It is fastest on data in random order; it is
-// not stable, and NaN keys are not ordered.
+// not stable, and NaN keys leave the result unsorted.
 func sortPersonByAgeDescLastFirst(data []Person) {
 	n := len(data)
 	if n < 2 {

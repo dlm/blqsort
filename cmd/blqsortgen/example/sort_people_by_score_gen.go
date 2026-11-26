@@ -413,7 +413,7 @@ func scanOrderSortPeopleByScore(data []Person, k int) (runs, ascEnd int) {
 
 // sortPeopleByScore sorts data by Score, with blqsort (a branchless quicksort,
 // github.com/dlm/blqsort). It is fastest on data in random order; it is
-// not stable, and NaN keys are not ordered.
+// not stable, and NaN keys leave the result unsorted.
 func sortPeopleByScore(data []Person) {
 	n := len(data)
 	if n < 2 {

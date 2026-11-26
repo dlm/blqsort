@@ -477,3 +477,27 @@ func blqSort[T cmp.Ordered](data []T) {
 func Sort[T cmp.Ordered](data []T) {
 	blqSort(moveNaNsFirst(data))
 }
+
+// SortByKey sorts data in ascending order of key(x), comparing keys with <.
+// The comparison is done here, branch-free, so key only needs to extract the
+// key (e.g. a field). The key of the pivot is computed once per partition,
+// so key is called about once per element per partition pass. Like Sort,
+// elements whose key is NaN are ordered before the others.
+func SortByKey[T any, K cmp.Ordered](data []T, key func(T) K) {
+	sortByKey(moveNaNKeysFirst(data, key), key)
+}
+
+// moveNaNKeysFirst is moveNaNsFirst for elements whose key is NaN.
+func moveNaNKeysFirst[T any, K cmp.Ordered](data []T, key func(T) K) []T {
+	if !mayHaveNaN[K]() {
+		return data
+	}
+	nan := 0
+	for i := range data {
+		if isNaN(key(data[i])) {
+			data[nan], data[i] = data[i], data[nan]
+			nan++
+		}
+	}
+	return data[nan:]
+}

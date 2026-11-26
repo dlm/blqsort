@@ -16,7 +16,7 @@ blqsort.SortFunc(users, cmpFn)                            // only fast with a br
 ```
 
 None of the sorts are stable. They don't allocate. `Sort` orders NaNs first,
-like `slices.Sort`.
+like `slices.Sort`, and `SortByKey` orders elements whose key is NaN first.
 
 ## Generated sorters for your own types
 
@@ -25,7 +25,7 @@ best speed on structs, generate a sorter specialized for your type and keys.
 Add the generator to your module as a tool (Go 1.24 or later):
 
 ```bash
-go get -tool github.com/dlm/blqsort/cmd/blqsortgen@v0.1.0
+go get -tool github.com/dlm/blqsort/cmd/blqsortgen@v0.1.1
 ```
 
 Then

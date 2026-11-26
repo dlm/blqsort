@@ -10,7 +10,7 @@
 // Add it to your module as a tool, so go run can find it (Go 1.24 or
 // later):
 //
-//	go get -tool github.com/dlm/blqsort/cmd/blqsortgen@v0.1.0
+//	go get -tool github.com/dlm/blqsort/cmd/blqsortgen@v0.1.1
 //
 // Usage, typically from a go:generate directive:
 //
@@ -33,7 +33,8 @@
 //	-pkg name   package name (default $GOPACKAGE, set by go generate)
 //
 // The comparison over several keys is generated branch-free, so it stays
-// fast on random data. NaN keys are not ordered. The sort is not stable.
+// fast on random data. NaN keys are not ordered, and they leave the other
+// elements unsorted too: filter them out first. The sort is not stable.
 // Every helper in the generated file is suffixed with the function name, so
 // several generated sorters can live in one package.
 package main
@@ -167,7 +168,7 @@ func generate(pkg, typ, fn string, keys []key, cmdline string) ([]byte, error) {
 	code, err = codegen.SetDoc(code, entry, fmt.Sprintf(
 		"%s sorts data by %s, with blqsort (a branchless quicksort,\n"+
 			"github.com/dlm/blqsort). It is fastest on data in random order; it is\n"+
-			"not stable, and NaN keys are not ordered.", fn, describe(keys)))
+			"not stable, and NaN keys leave the result unsorted.", fn, describe(keys)))
 	if err != nil {
 		return nil, err
 	}
