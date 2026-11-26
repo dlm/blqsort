@@ -7,6 +7,11 @@
 // int and two string keys in the example package (string comparisons are
 // calls, and large elements cost more to move).
 //
+// Add it to your module as a tool, so go run can find it (Go 1.24 or
+// later):
+//
+//	go get -tool github.com/dlm/blqsort/cmd/blqsortgen@v0.1.0
+//
 // Usage, typically from a go:generate directive:
 //
 //	//go:generate go run github.com/dlm/blqsort/cmd/blqsortgen -type Person -by=-Age,Name.Last

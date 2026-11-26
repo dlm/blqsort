@@ -21,7 +21,14 @@ like `slices.Sort`.
 ## Generated sorters for your own types
 
 `SortByKey` and friends call your function for every comparison. For the
-best speed on structs, generate a sorter specialized for your type and keys:
+best speed on structs, generate a sorter specialized for your type and keys.
+Add the generator to your module as a tool (Go 1.24 or later):
+
+```bash
+go get -tool github.com/dlm/blqsort/cmd/blqsortgen@v0.1.0
+```
+
+Then
 
 ```go
 //go:generate go run github.com/dlm/blqsort/cmd/blqsortgen -type Person -by=-Age,Name.Last
