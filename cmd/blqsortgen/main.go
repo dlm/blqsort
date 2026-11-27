@@ -1,11 +1,12 @@
 // Command blqsortgen generates a blqsort (branchless quicksort) specialized
 // for one element type and sort key, as a self-contained Go file in your
 // package. Specialized code inlines the comparison, which is what makes
-// branchless sorting pay off for structs. Measured against slices.SortFunc on
-// random data (amd64): about 3.5x faster on 8-byte records with an integer
-// key, 1.8x on 64-byte records, and 1.4x on the 56-byte records with an
-// int and two string keys in the example package (string comparisons are
-// calls, and large elements cost more to move).
+// branchless sorting pay off for structs. Measured against slices.SortFunc
+// with cmp.Compare on 1M random records: about 3.2x faster on 8-byte records
+// with an integer key and 2.1x on 64-byte records (Intel), 4.4x and 1.7x
+// (Apple M1). The gain shrinks as records grow, because blqsort moves
+// elements more than pdqsort does; from about 32 bytes up, a pdqsort
+// specialized the same way is faster.
 //
 // Add it to your module as a tool, so go run can find it (Go 1.24 or
 // later):

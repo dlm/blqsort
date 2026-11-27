@@ -3,9 +3,9 @@
 A branchless quicksort for Go, ported from
 [blqsort](https://github.com/chkas/blqsort) by Christof Kaser. It is built for
 **data whose comparisons are unpredictable**, i.e. random data, where it is
-about 2.5–3x faster than `slices.Sort` on amd64 (Intel) and 3–3.7x on arm64
-(Apple M1 Pro) for large inputs. It is ahead from 100 elements up (1.4x on
-Intel, 2.7x on M1 at 100 random ints), if the data is actually fresh; see
+about 2.4–2.9x faster than `slices.Sort` on amd64 (Intel) and 2.8–3.7x on
+arm64 (Apple M1 Pro) for large inputs. It is ahead from 100 elements up (1.4x
+on Intel, 2.8x on M1 at 100 random ints), if the data is actually fresh; see
 "Benchmarking small sorts" below.
 
 ```go
@@ -39,9 +39,11 @@ writes a self-contained file (no dependency on this module) with
 then `Name.Last`. Multi-key comparisons are generated branch-free. Several
 generated sorters can share a package. See `go doc
 github.com/dlm/blqsort/cmd/blqsortgen` and `cmd/blqsortgen/example`. On
-random data it was about 3.5x faster than `slices.SortFunc` for 8-byte
-records with an integer key, and 1.4x for 56-byte records sorted by an int
-and two strings.
+1M random records it was about 3.2x faster than `slices.SortFunc` with
+`cmp.Compare` for 8-byte records with an integer key (4.4x on M1), and 2.1x
+for 64-byte records (1.7x on M1). The gain shrinks as records grow, since
+blqsort moves elements more than pdqsort does: from 32 bytes up, a pdqsort
+specialized the same way was faster (`BenchmarkSpecialized`).
 
 ## When to use it
 
@@ -62,24 +64,25 @@ with a simple less function.
 ## Results
 
 Single-threaded, medians from `run-benchmarks.sh` in
-[blqsort-experiments](https://github.com/dlm/blqsort-experiments) (Go 1.26):
+[blqsort-experiments](https://github.com/dlm/blqsort-experiments) (v0.1.1,
+Go 1.26):
 Intel Core Ultra X7 358H pinned to one performance core, and Apple M1 Pro
 (macOS can't pin). Milliseconds for 1M int64 (`BenchmarkLibraryShapes`):
 
 | int64, 1M | | `slices.Sort` | **blqsort** | radix (zermelo) | sorty (1 goroutine) |
 |---|---|---|---|---|---|
-| random | Intel | 57.1 | 22.1 | 22.9 | 49.0 |
-| | M1 Pro | 64.3 | 17.6 | 12.0 | 56.7 |
-| 10 distinct values | Intel | 9.90 | 3.63 | 4.71 | 13.8 |
-| | M1 Pro | 11.3 | 4.86 | 3.84 | 17.3 |
-| sorted | Intel | 0.37 | 0.29 | 0.84 | 3.72 |
-| | M1 Pro | 0.63 | 0.33 | 0.70 | 7.15 |
-| reversed | Intel | 0.64 | 0.59 | 14.9 | 3.88 |
-| | M1 Pro | 0.93 | 0.79 | 12.6 | 7.31 |
-| `i % 8` | Intel | 2.02 | 2.15 | 4.57 | 6.90 |
-| | M1 Pro | 2.99 | 3.12 | 3.70 | 10.1 |
-| `i ^ 0xcccc` | Intel | 20.4 | 21.4 | 14.0 | 13.0 |
-| | M1 Pro | 24.7 | 17.3 | 12.4 | 18.0 |
+| random | Intel | 56.9 | 22.0 | 22.8 | 49.1 |
+| | M1 Pro | 64.2 | 17.6 | 11.6 | 56.4 |
+| 10 distinct values | Intel | 9.87 | 3.61 | 4.70 | 13.8 |
+| | M1 Pro | 11.3 | 4.86 | 3.82 | 17.2 |
+| sorted | Intel | 0.37 | 0.29 | 0.84 | 3.69 |
+| | M1 Pro | 0.63 | 0.32 | 0.71 | 7.15 |
+| reversed | Intel | 0.63 | 0.59 | 14.9 | 3.92 |
+| | M1 Pro | 0.91 | 0.75 | 12.6 | 7.31 |
+| `i % 8` | Intel | 2.01 | 2.14 | 4.56 | 6.85 |
+| | M1 Pro | 2.93 | 3.08 | 3.67 | 10.0 |
+| `i ^ 0xcccc` | Intel | 20.3 | 21.2 | 14.0 | 13.2 |
+| | M1 Pro | 24.3 | 17.2 | 12.4 | 18.0 |
 
 Radix numbers are with a caller-supplied buffer; without one it allocates n
 elements per call. Random data, speedup over `slices.Sort`
@@ -87,9 +90,9 @@ elements per call. Random data, speedup over `slices.Sort`
 
 | | Intel | M1 Pro |
 |---|---|---|
-| int64, 100 / 1,000 / 10,000 elements (fresh inputs, `BenchmarkCrossover`) | 1.40x / 1.85x / 2.14x | 2.75x / 3.28x / 3.55x |
-| int64, 100K / 1M / 10M | 2.40x / 2.57x / 2.59x | 3.67x / 3.60x / 3.64x |
-| float64, 100K / 1M / 10M | 2.67x / 2.85x / 2.85x | 2.80x / 3.00x / 3.20x |
+| int64, 100 / 1,000 / 10,000 elements (fresh inputs, `BenchmarkCrossover`) | 1.40x / 1.86x / 2.16x | 2.80x / 3.28x / 3.50x |
+| int64, 100K / 1M / 10M | 2.41x / 2.59x / 2.60x | 3.60x / 3.60x / 3.67x |
+| float64, 100K / 1M / 10M | 2.68x / 2.86x / 2.87x | 2.78x / 2.98x / 3.13x |
 
 ### Benchmarking small sorts
 
